@@ -1,156 +1,298 @@
-"""Tests for your app. Run them with `pytest`.
+"""Tests for Stargazing Tonight.
 
-Keep these. Publishing runs them, and a repository whose tests fail does not
-deploy — which is the fastest feedback you will get all day, because the
-alternative is finding out from a user that your app answers wrongly.
-
-`LocalRunner` is the same code the production runtime uses to call your app.
-So a call that works here works deployed, and — more usefully — a `Result`
-that violates your manifest fails here exactly as it would in production.
-That is the whole reason to test through the runner rather than calling
-`App().handle(...)` directly.
+Everything runs through LocalRunner, which enforces manifest.yaml exactly as
+the live runtime does, and `_fetch` is replaced so no test touches the network.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+import urllib.error
+from datetime import datetime, timedelta, timezone
 
 import pytest
-from pippa_agentapp_sdk import LocalRunner, OutputShapeViolation
+from pippa_agentapp_sdk import (
+    LocalRunner,
+    OutputShapeViolation,
+    ServiceUnavailableError,
+)
 
-from app import App, CannotReadDate
+from app import (
+    SITES,
+    App,
+    NoPlaceGiven,
+    OutsideCoverage,
+    PlaceNotFound,
+    dark_window,
+    moon_phase,
+    sun_altitude,
+)
 
-# A fixed "now", so a test that passes today still passes next March.
-# 21:00 UTC on purpose: it is already the next day in New Zealand, which is
-# what makes the time zone test below mean anything. At 09:00 UTC it is still
-# the same day everywhere that matters, and the test would pass whether or not
-# the code handled time zones at all.
-NOW = datetime(2026, 10, 22, 21, 0, tzinfo=timezone.utc)
+# 16:00 UTC on 20 November 2026: daylight in Sheffield, dark within the hour.
+NOW = datetime(2026, 11, 20, 16, 0, tzinfo=timezone.utc)
+
+SHEFFIELD = {"lat": 53.383, "lon": -1.466}
+
+GEOCODE_SHEFFIELD = json.dumps({"results": [{
+    "name": "Sheffield", "admin1": "England", "country_code": "GB",
+    "latitude": SHEFFIELD["lat"], "longitude": SHEFFIELD["lon"],
+    "timezone": "Europe/London",
+}]}).encode()
+
+RESERVES = json.dumps([
+    {"name": "Sunnybank Local Nature Reserve", "lat": "53.3733", "lon": "-1.4842"},
+    {"name": "SRWT Carr House Meadows", "lat": "53.4400", "lon": "-1.5300"},
+]).encode()
 
 
-def call(inputs: dict, outcome: str = "days.until", *, explicit: bool = False):
-    """Run one outcome the way the runtime does, and return the Result.
+def hourly(cloud_for_hour) -> dict:
+    """One location's forecast: two days of hours from midnight UTC."""
+    start = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    times = [start + timedelta(hours=h) for h in range(48)]
+    return {"hourly": {
+        "time": [t.strftime("%Y-%m-%dT%H:%M") for t in times],
+        "cloud_cover": [cloud_for_hour(t) for t in times],
+    }}
 
-    `granted_secrets` is required even though a hackathon app never has any —
-    the runner takes it on every call, so an empty dict is how you say "none".
 
-    `explicit=True` calls the app the way Pippa does when the person picked
-    it by name (`@Days Until ...`) instead of Pippa choosing it. The app sees
-    it as `call.context.explicit`.
-    """
-    return LocalRunner(App()).call(
-        outcome, inputs, granted_secrets={}, now=NOW, request_id="test-1",
-        explicit=explicit,
+def forecast_for(url: str, cloud_by_index) -> bytes:
+    """A multi-location answer with one series per requested latitude."""
+    from urllib.parse import parse_qs, urlparse
+
+    count = len(parse_qs(urlparse(url).query)["latitude"][0].split(","))
+    return json.dumps([hourly(lambda t, i=i: cloud_by_index(i, t))
+                       for i in range(count)]).encode()
+
+
+def fake_fetch(*, geocode=GEOCODE_SHEFFIELD, reserves=RESERVES,
+               cloud=lambda i, t: 10, fail_on=None):
+    def fetch(url: str, timeout: float = 6.0) -> bytes:
+        if fail_on and fail_on in url:
+            raise TimeoutError("timed out")
+        if "geocoding-api.open-meteo.com" in url:
+            return geocode
+        if "nominatim.openstreetmap.org" in url:
+            if isinstance(reserves, Exception):
+                raise reserves
+            return reserves
+        if "api.open-meteo.com/v1/forecast" in url:
+            return forecast_for(url, cloud)
+        if "api.postcodes.io" in url:
+            return json.dumps({"status": 200, "result": {
+                "postcode": "S1 2HE", "latitude": 53.381, "longitude": -1.470,
+                "admin_district": "Sheffield"}}).encode()
+        raise AssertionError(f"unexpected url {url}")
+
+    return fetch
+
+
+def run(inputs: dict, fetch=None, *, explicit: bool = False, now=NOW):
+    instance = App()
+    instance._fetch = fetch or fake_fetch()
+    return LocalRunner(instance).call(
+        "stars.tonight", inputs, granted_secrets={}, now=now,
+        request_id="test-1", explicit=explicit,
     ).result
 
 
 def test_the_manifest_is_valid():
-    """The first thing to break, and the easiest to miss.
-
-    `App()` validates manifest.yaml as it is constructed, so this fails the
-    moment the manifest is malformed — before anything else has a chance to
-    produce a more confusing error.
-    """
-    app = App()
-    assert app.manifest.app_id.startswith("hack.")
-    assert [o.id for o in app.manifest.outcomes] == ["days.until"]
+    instance = App()
+    assert instance.manifest.app_id == "hack.app_bc12"
+    assert [o.id for o in instance.manifest.outcomes] == ["stars.tonight"]
 
 
-def test_it_counts_the_days():
-    result = call({"date": "2026-12-25"})
-    assert result.data["days"] == 64
-    assert result.data["target_date"] == "2026-12-25"
-    assert result.data["weekday"] == "Friday"
-    assert result.data["already_passed"] is False
+def test_a_clear_night_recommends_the_nearest_dark_spot():
+    result = run({"place": "Sheffield"})
+    data = result.data
+    assert data["place_used"] == "Sheffield, England"
+    assert data["timezone_used"] == "Europe/London"
+    assert data["good_night"] is True
+    assert data["best_spot"] == "Surprise View, Peak District"
+    assert 5 < data["best_spot_distance_km"] < 20
+    assert data["best_spot_cloud_percent"] == 10
+    assert data["cloud_threshold_percent"] == 30
+    assert len(data["other_spots"]) == 5
+    assert all("km" in s and "% cloud" in s for s in data["other_spots"])
+    assert data["nearby_park"] == "SRWT Carr House Meadows"
+    assert data["nearby_park_cloud_percent"] == 10
+    assert "Surprise View" in result.narrative
 
 
-def test_a_date_written_in_words_works():
-    result = call({"date": "25 December"})
-    assert result.data["target_date"] == "2026-12-25"
+def test_a_cloudy_nearest_spot_loses_to_a_clear_one_further_away():
+    # Index 0 is the place itself, 1 is the nearest dark spot.
+    def cloud(i, t):
+        return 95 if i in (0, 1) else 5
+
+    data = run({"place": "Sheffield"}, fake_fetch(cloud=cloud)).data
+    assert data["best_spot"] != "Surprise View, Peak District"
+    assert data["best_spot_cloud_percent"] == 5
+    assert data["local_cloud_percent"] == 95
+    assert data["good_night"] is True
 
 
-def test_a_date_already_gone_rolls_to_next_year():
-    """`1 January` asked in October means the January that is coming."""
-    result = call({"date": "1 January"})
-    assert result.data["target_date"] == "2027-01-01"
-    assert result.data["already_passed"] is False
+def test_cloud_everywhere_is_not_a_good_night():
+    data = run({"place": "Sheffield"}, fake_fetch(cloud=lambda i, t: 80)).data
+    assert data["good_night"] is False
+    assert data["best_spot_cloud_percent"] == 80
 
 
-def test_the_users_timezone_decides_what_today_is():
-    """21:00 UTC is already tomorrow in Auckland.
+def test_on_a_cloudy_night_a_nearby_spot_beats_a_slightly_clearer_far_one():
+    def cloud(i, t):
+        return 60 if i == 1 else (50 if i == 6 else 90)
 
-    Worth a test of its own: it is the bug every date app has, it only shows
-    up for users in some parts of the world, and it is invisible if you only
-    ever test from one place.
-    """
-    here = call({"date": "2026-10-23"}).data["days"]
-    there = call({"date": "2026-10-23", "timezone": "Pacific/Auckland"}).data["days"]
-    assert here == 1    # still the 22nd in UTC
-    assert there == 0   # already the 23rd in Auckland
+    data = run({"place": "Sheffield"}, fake_fetch(cloud=cloud)).data
+    assert data["good_night"] is False
+    assert data["best_spot"] == "Surprise View, Peak District"
 
 
-def test_a_made_up_timezone_never_reaches_the_app():
-    """The platform checks declared types before your code runs.
-
-    `type: timezone` in the manifest means the runtime validates it. So your
-    app does not need to — and should not, because a hand-rolled check here
-    would be dead code that looks load-bearing.
-    """
-    from pippa_agentapp_sdk import InputShapeViolation
-
-    with pytest.raises(InputShapeViolation):
-        call({"date": "2026-12-25", "timezone": "Mars/Olympus"})
+def test_dublin_is_sent_to_an_irish_spot_not_across_the_sea():
+    dublin = json.dumps({"results": [{
+        "name": "Dublin", "admin1": "Leinster", "country_code": "IE",
+        "latitude": 53.35, "longitude": -6.26, "timezone": "Europe/Dublin"}]}).encode()
+    data = run({"place": "Dublin"}, fake_fetch(geocode=dublin)).data
+    assert data["best_spot"] == "Sally Gap, Wicklow Mountains"
+    assert data["timezone_used"] == "Europe/Dublin"
+    assert not any("Anglesey" in s for s in data["other_spots"])
 
 
-def test_no_date_is_an_error_a_user_can_read():
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""})
-    # `user_message` is the only part a user may be shown, so it is the part
-    # worth asserting on. The rest stays in the logs.
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_the_clearest_hour_is_reported():
+    def cloud(i, t):
+        return 0 if t.hour == 22 else 20
+
+    data = run({"place": "Sheffield"}, fake_fetch(cloud=cloud)).data
+    assert data["best_time"] == "22:00"   # GMT == UK time in November
 
 
-def test_nonsense_is_refused_rather_than_guessed():
-    with pytest.raises(CannotReadDate):
-        call({"date": "a week on Thursday-ish"})
+def test_the_backup_reserve_is_optional():
+    data = run({"place": "Sheffield"},
+               fake_fetch(reserves=TimeoutError("slow"))).data
+    assert "nearby_park" not in data
+    assert "nearby_park_distance_km" not in data
+    assert data["best_spot"]
 
 
-def test_picked_by_name_it_answers_and_refuses_as_usual():
-    """`@Days Until ...` in the chat: the person picked this app themselves.
+def test_a_backup_further_than_the_dark_spot_is_left_out():
+    far = json.dumps([{"name": "Distant Reserve", "lat": "53.49", "lon": "-1.33"}]).encode()
+    data = run({"place": "Sheffield"}, fake_fetch(reserves=far)).data
+    assert "nearby_park" not in data
 
-    Then nothing checks whether the message suits the app. It is called
-    whatever the words, and `call.context.explicit` is True. The right
-    response is the ordinary one: answer what you can, and refuse only for a
-    missing or unreadable input, with a sentence that says what was wrong.
-    Never refuse because the message does not look like your example phrases
-    — the person has already told you it is for you.
 
-    This app never reads the flag, because it never needed to: it already
-    refuses only for a missing or unreadable date. If yours does, read it as
-    `getattr(call.context, "explicit", False)`. An app published before the
-    platform update that added the flag runs on an SDK that does not have
-    it, until you publish it again.
-    """
-    picked = call({"date": "2026-12-25"}, explicit=True)
-    assert picked.data == call({"date": "2026-12-25"}).data
+def test_no_reserves_found_leaves_the_backup_out():
+    data = run({"place": "Sheffield"}, fake_fetch(reserves=b"[]")).data
+    assert "nearby_park" not in data
 
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""}, explicit=True)
-    assert failure.value.user_message == "I could not work out which date you meant."
+
+def test_a_postcode_is_looked_up_directly():
+    data = run({"place": "s1 2he"}).data
+    assert data["place_used"] == "S1 2HE, Sheffield"
+
+
+def test_an_unknown_place_says_which_place():
+    with pytest.raises(PlaceNotFound) as failure:
+        run({"place": "Narnia"}, fake_fetch(geocode=b'{"generationtime_ms": 0.1}'))
+    assert failure.value.user_message == "I could not find Narnia in the UK or Ireland."
+
+
+def test_a_place_abroad_is_refused_politely():
+    paris = json.dumps({"results": [{
+        "name": "Paris", "country_code": "FR", "latitude": 48.85,
+        "longitude": 2.35, "timezone": "Europe/Paris"}]}).encode()
+    with pytest.raises(OutsideCoverage) as failure:
+        run({"place": "Paris"}, fake_fetch(geocode=paris))
+    assert "Paris" in failure.value.user_message
+
+
+def test_no_place_asks_for_one_even_when_picked_by_name():
+    for explicit in (False, True):
+        with pytest.raises(NoPlaceGiven) as failure:
+            run({"place": ""}, explicit=explicit)
+        assert "town or postcode" in failure.value.user_message
+    with pytest.raises(NoPlaceGiven):
+        run({})
+
+
+def test_picked_by_name_answers_the_same():
+    assert run({"place": "Sheffield"}, explicit=True).data == run({"place": "Sheffield"}).data
+
+
+def test_a_weather_timeout_is_a_retryable_service_error():
+    with pytest.raises(ServiceUnavailableError):
+        run({"place": "Sheffield"}, fake_fetch(fail_on="api.open-meteo.com/v1/forecast"))
+
+
+def test_a_weather_rate_limit_is_retryable():
+    def fetch(url, timeout=6.0):
+        if "forecast" in url:
+            raise urllib.error.HTTPError(url, 429, "Too Many", {}, None)
+        return fake_fetch()(url, timeout)
+
+    from pippa_agentapp_sdk import RateLimitedError
+
+    with pytest.raises(RateLimitedError):
+        run({"place": "Sheffield"}, fetch)
+
+
+def test_an_empty_forecast_is_an_error_not_a_clear_sky():
+    def fetch(url, timeout=6.0):
+        if "forecast" in url:
+            return b"[]"
+        return fake_fetch()(url, timeout)
+
+    with pytest.raises(ServiceUnavailableError):
+        run({"place": "Sheffield"}, fetch)
+
+
+def test_a_distance_limit_is_respected():
+    data = run({"place": "Sheffield", "max_distance_km": 30}).data
+    assert data["best_spot_distance_km"] <= 30
+
+
+def test_an_impossible_distance_limit_falls_back_to_the_nearest():
+    result = run({"place": "Sheffield", "max_distance_km": 1})
+    assert result.data["best_spot"] == "Surprise View, Peak District"
+    assert "within 1 km" in result.narrative
+
+
+def test_darkness_in_a_sheffield_november():
+    start, end, fully = dark_window(NOW, SHEFFIELD["lat"], SHEFFIELD["lon"])
+    assert fully is True
+    # Nautical dusk around 17:30 GMT, nautical dawn around 06:20 GMT.
+    assert datetime(2026, 11, 20, 17, 0, tzinfo=timezone.utc) <= start <= datetime(2026, 11, 20, 17, 50, tzinfo=timezone.utc)
+    assert datetime(2026, 11, 21, 6, 0, tzinfo=timezone.utc) <= end <= datetime(2026, 11, 21, 6, 50, tzinfo=timezone.utc)
+
+
+def test_never_fully_dark_in_a_shetland_midsummer():
+    june = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    _, _, fully = dark_window(june, 60.15, -1.15)
+    assert fully is False
+
+
+def test_the_sun_is_high_at_noon_and_low_at_midnight():
+    noon = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    midnight = datetime(2026, 6, 21, 0, 0, tzinfo=timezone.utc)
+    assert 55 < sun_altitude(noon, 51.48, 0.0) < 65      # Greenwich, about 62
+    assert sun_altitude(midnight, 51.48, 0.0) < -10
+
+
+def test_moon_phases_on_known_dates():
+    # Full moon 24 November 2026; new moon 9 November 2026.
+    phase, lit = moon_phase(datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+    assert phase == "full moon" and lit >= 95
+    phase, lit = moon_phase(datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc))
+    assert phase == "new moon" and lit <= 5
+
+
+def test_every_site_is_in_the_uk_or_ireland():
+    assert len(SITES) >= 40
+    for site in SITES:
+        assert 49.8 <= site["lat"] <= 60.9, site["name"]
+        assert -10.7 <= site["lon"] <= 1.8, site["name"]
+        assert site["name"] and site["type"] and site["region"]
 
 
 def test_the_runner_enforces_the_manifest(monkeypatch):
-    """Proof that the contract is real, and the reason to test through it.
-
-    An app returning a field it did not declare is refused. You will meet this
-    error if you add something to `data` and forget to add it to `output` in
-    manifest.yaml — which is the single most common way a first app fails
-    after it deploys.
-    """
     from pippa_agentapp_sdk import Result
 
-    monkeypatch.setattr(
-        App, "handle", lambda self, c: Result(data={"surprise": "hello"})
-    )
+    monkeypatch.setattr(App, "handle", lambda self, c: Result(data={"surprise": 1}))
     with pytest.raises(OutputShapeViolation):
-        call({"date": "2026-12-25"})
+        run({"place": "Sheffield"})
