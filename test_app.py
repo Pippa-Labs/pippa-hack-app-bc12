@@ -1,4 +1,4 @@
-"""Tests for Stargazing Tonight.
+"""Tests for Starspy.
 
 Everything runs through LocalRunner, which enforces manifest.yaml exactly as
 the live runtime does, and `_fetch` is replaced so no test touches the network.

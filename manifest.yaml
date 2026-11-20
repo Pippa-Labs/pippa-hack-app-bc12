@@ -44,7 +44,7 @@ app_author_name: "stargazer"
 app:
   # Set from the repository name (pippa-hack-app-bc12). Do not change it.
   id: hack.app_bc12
-  name: Stargazing Tonight
+  name: Starspy
   # Bump this (0.1.0 -> 0.1.1) after a version has been submitted for review.
   version: 0.1.0
   # Never use the word "b-y" here: the badge splits on it.

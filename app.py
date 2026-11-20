@@ -1,4 +1,4 @@
-"""Stargazing Tonight.
+"""Starspy.
 
 Given a town or postcode in the UK or Ireland, find where to go stargazing
 tonight: the nearest known dark-sky place with clear skies, a nearby nature
